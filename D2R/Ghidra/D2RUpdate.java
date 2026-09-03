@@ -1,495 +1,1547 @@
-// Port of D2R/update.py for Ghidra.
-// Reuses D2R/data/functions.json and variables.json without changing their format.
-//@author d2.re contributors
-//@category D2R
+// D2RUpdate.java
+// Ghidra port of D2R/update.py
+//
+// Run from Ghidra Script Manager after importing/analyzing D2R.exe.
+// When prompted, select the repository's D2R directory, e.g.
+// D:\Projects\RE\d2.re\D2R
+//
+// This version includes a corrected masked byte-pattern scanner and
+// startup diagnostics to distinguish scanner failures from stale signatures.
 
-import com.google.gson.*;
-import ghidra.app.cmd.function.ApplyFunctionSignatureCmd;
 import ghidra.app.script.GhidraScript;
-import ghidra.app.services.DataTypeManagerService;
-import ghidra.app.util.parser.FunctionSignatureParser;
-import ghidra.program.model.address.*;
-import ghidra.program.model.data.*;
-import ghidra.program.model.listing.*;
-import ghidra.program.model.mem.*;
+import ghidra.program.model.address.Address;
+import ghidra.program.model.address.AddressSpace;
+import ghidra.program.model.listing.CodeUnit;
+import ghidra.program.model.listing.Function;
+import ghidra.program.model.listing.Instruction;
+import ghidra.program.model.mem.Memory;
+import ghidra.program.model.mem.MemoryBlock;
 import ghidra.program.model.scalar.Scalar;
-import ghidra.program.model.symbol.*;
-import ghidra.util.data.DataTypeParser;
-import ghidra.util.data.DataTypeParser.AllowedDataTypes;
+import ghidra.program.model.symbol.Reference;
+import ghidra.program.model.symbol.SourceType;
+import ghidra.program.model.symbol.Symbol;
 
-import java.io.*;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.util.*;
+import com.google.gson.Gson;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+
+import java.io.File;
+import java.io.FileReader;
+import java.util.ArrayList;
+import java.util.List;
 
 public class D2RUpdate extends GhidraScript {
 
     private static class PatternBytes {
         final byte[] bytes;
         final byte[] mask;
+
         PatternBytes(byte[] bytes, byte[] mask) {
             this.bytes = bytes;
             this.mask = mask;
         }
     }
 
-    private File d2rDir;
-    private Address imageBase;
-    private Listing listing;
-    private Memory memory;
-    private FunctionManager functionManager;
-    private SymbolTable symbolTable;
-    private DataTypeManager dataTypeManager;
-    private DataTypeManagerService dtmService;
+    private final Gson gson = new Gson();
 
-    private int functionCount = 0;
-    private int variableCount = 0;
-    private int brokenCount = 0;
-    private int typeFailureCount = 0;
+    private File d2rDirectory;
+    private File dataDirectory;
+
+    private List<JsonObject> functions = new ArrayList<>();
+    private List<JsonObject> variables = new ArrayList<>();
+
+    private int renamedFunctions = 0;
+    private int renamedVariables = 0;
+    private int brokenSignatures = 0;
+    private int resolutionFailures = 0;
+    private int typeApplicationsSkippedOrFailed = 0;
 
     @Override
-    public void run() throws Exception {
-        if (currentProgram == null) {
-            popup("Open D2R.exe in Ghidra before running D2RUpdate.");
+    protected void run() throws Exception {
+        println("=== D2R Ghidra importer ===");
+        println("Program: " + currentProgram.getName());
+        println("Image base: " + currentProgram.getImageBase());
+
+        printMemoryDiagnostics();
+        runExactScannerSelfTest();
+
+        d2rDirectory = askDirectory(
+            "Select the d2.re D2R directory",
+            "Select"
+        );
+
+        dataDirectory = new File(d2rDirectory, "data");
+
+        if (!dataDirectory.isDirectory()) {
+            printerr(
+                "Missing data directory: " +
+                dataDirectory.getAbsolutePath()
+            );
             return;
         }
 
-        File selected = askDirectory("Select the d2.re D2R directory", "Select D2R");
-        d2rDir = normalizeD2RDirectory(selected);
-        if (d2rDir == null) {
-            popup("Could not find data/functions.json and data/variables.json under the selected directory.");
-            return;
-        }
+        functions = loadJsonItems(
+            "functions.json",
+            "_functions.json"
+        );
 
-        imageBase = currentProgram.getImageBase();
-        listing = currentProgram.getListing();
-        memory = currentProgram.getMemory();
-        functionManager = currentProgram.getFunctionManager();
-        symbolTable = currentProgram.getSymbolTable();
-        dataTypeManager = currentProgram.getDataTypeManager();
-        dtmService = state.getTool().getService(DataTypeManagerService.class);
+        variables = loadJsonItems(
+            "variables.json",
+            "_variables.json"
+        );
 
-        println("// d2.re Ghidra updater");
-        println("// Program: " + currentProgram.getName());
-        println("// Image Base: " + imageBase);
-        println("// Data directory: " + new File(d2rDir, "data").getAbsolutePath());
+        println("Loaded functions: " + functions.size());
+        println("Loaded variables: " + variables.size());
 
-        List<JsonObject> functions = loadEntries("functions.json", "_functions.json");
-        List<JsonObject> variables = loadEntries("variables.json", "_variables.json");
-
-        println("Loaded " + functions.size() + " function signatures and " + variables.size() + " variable signatures.");
-
-        for (JsonObject item : functions) {
-            if (monitor.isCancelled()) return;
-            applyFunctionEntry(item);
-        }
-
-        for (JsonObject item : variables) {
-            if (monitor.isCancelled()) return;
-            applyVariableEntry(item);
-        }
-
-        renameKnownTables(variables);
+        runRepositorySignatureSelfTest();
 
         println("");
-        println("Renamed/created " + functionCount + " functions and " + variableCount + " variables.");
-        println("Broken signatures: " + brokenCount);
-        println("Type/signature applications skipped or failed: " + typeFailureCount);
+        println("=== Processing functions ===");
+
+        for (JsonObject item : functions) {
+            if (monitor.isCancelled()) {
+                break;
+            }
+
+            processFunction(item);
+        }
+
+        println("");
+        println("=== Processing variables ===");
+
+        for (JsonObject item : variables) {
+            if (monitor.isCancelled()) {
+                break;
+            }
+
+            processVariable(item);
+        }
+
+        println("");
+        println("=== Expanding known D2R function tables ===");
+
+        expandKnownFunctionTables();
+
+        println("");
+        println(
+            "Renamed/created " +
+            renamedFunctions +
+            " functions and " +
+            renamedVariables +
+            " variables."
+        );
+
+        println(
+            "Broken signatures: " +
+            brokenSignatures
+        );
+
+        println(
+            "Address/operand resolution failures: " +
+            resolutionFailures
+        );
+
+        println(
+            "Type/signature applications skipped or failed: " +
+            typeApplicationsSkippedOrFailed
+        );
+
         println("Done.");
     }
 
-    private File normalizeD2RDirectory(File selected) {
-        if (selected == null) return null;
-        if (hasDataFiles(selected)) return selected;
-        File child = new File(selected, "D2R");
-        if (hasDataFiles(child)) return child;
+    // ================================================================
+    // Diagnostics
+    // ================================================================
+
+    private void printMemoryDiagnostics() {
+        println("");
+        println("=== Memory map ===");
+
+        for (MemoryBlock block :
+            currentProgram.getMemory().getBlocks()) {
+
+            println(
+                "Memory block: " +
+                block.getName() +
+                " " +
+                block.getStart() +
+                " - " +
+                block.getEnd() +
+                " initialized=" +
+                block.isInitialized() +
+                " execute=" +
+                block.isExecute()
+            );
+        }
+    }
+
+    /*
+     * Take bytes directly from Ghidra's first executable block
+     * and search for them again.
+     *
+     * This must find the same address. If it does not, the
+     * underlying scanner itself is not functioning correctly.
+     */
+    private void runExactScannerSelfTest()
+        throws Exception {
+
+        println("");
+        println("=== Exact scanner self-test ===");
+
+        Memory memory =
+            currentProgram.getMemory();
+
+        MemoryBlock executable = null;
+
+        for (MemoryBlock block :
+            memory.getBlocks()) {
+
+            if (
+                block.isInitialized() &&
+                block.isExecute() &&
+                block.getSize() > 0
+            ) {
+                executable = block;
+                break;
+            }
+        }
+
+        if (executable == null) {
+            println(
+                "Exact scanner self-test: SKIPPED " +
+                "(no initialized executable block)"
+            );
+            return;
+        }
+
+        int testLength =
+            (int)Math.min(
+                8L,
+                executable.getSize()
+            );
+
+        byte[] testBytes =
+            new byte[testLength];
+
+        int read =
+            memory.getBytes(
+                executable.getStart(),
+                testBytes
+            );
+
+        if (read != testLength) {
+            println(
+                "Exact scanner self-test: FAILED " +
+                "(could not read initial executable bytes)"
+            );
+            return;
+        }
+
+        StringBuilder sb =
+            new StringBuilder();
+
+        for (byte b : testBytes) {
+            sb.append(
+                String.format(
+                    "%02X ",
+                    b & 0xff
+                )
+            );
+        }
+
+        println(
+            "Executable block: " +
+            executable.getName()
+        );
+
+        println(
+            "First executable bytes: " +
+            sb.toString().trim()
+        );
+
+        Address selfMatch =
+            memory.findBytes(
+                executable.getStart(),
+                executable.getEnd(),
+                testBytes,
+                null,
+                true,
+                monitor
+            );
+
+        println(
+            "Exact scanner self-test result: " +
+            (
+                selfMatch == null
+                    ? "NOT FOUND"
+                    : selfMatch.toString()
+            )
+        );
+
+        if (
+            selfMatch == null ||
+            !selfMatch.equals(
+                executable.getStart()
+            )
+        ) {
+            println(
+                "WARNING: scanner self-test did not " +
+                "return the expected address."
+            );
+        }
+    }
+
+    private void runRepositorySignatureSelfTest()
+        throws Exception {
+
+        println("");
+        println(
+            "=== Repository signature scanner test ==="
+        );
+
+        JsonObject first = null;
+
+        if (!functions.isEmpty()) {
+            first = functions.get(0);
+        }
+        else if (!variables.isEmpty()) {
+            first = variables.get(0);
+        }
+
+        if (first == null) {
+            println(
+                "Repository scanner test: SKIPPED " +
+                "(no signatures loaded)"
+            );
+            return;
+        }
+
+        String name =
+            getString(
+                first,
+                "name",
+                "<unnamed>"
+            );
+
+        String pattern =
+            getString(
+                first,
+                "pattern",
+                null
+            );
+
+        if (
+            pattern == null ||
+            pattern.trim().isEmpty()
+        ) {
+            println(
+                "Repository scanner test: SKIPPED " +
+                "(first item has no pattern)"
+            );
+            return;
+        }
+
+        println(
+            "Scanner test name: " +
+            name
+        );
+
+        println(
+            "Scanner test pattern: " +
+            pattern
+        );
+
+        PatternBytes parsed =
+            parsePattern(pattern);
+
+        int exact =
+            countExactMaskBytes(
+                parsed.mask
+            );
+
+        println(
+            "Scanner test bytes: " +
+            parsed.bytes.length
+        );
+
+        println(
+            "Scanner test exact bytes: " +
+            exact
+        );
+
+        println(
+            "Scanner test wildcard bytes: " +
+            (
+                parsed.mask.length -
+                exact
+            )
+        );
+
+        Address result =
+            findPattern(pattern);
+
+        println(
+            "Scanner test result: " +
+            (
+                result == null
+                    ? "NOT FOUND"
+                    : "FOUND at " + result
+            )
+        );
+    }
+
+    private int countExactMaskBytes(
+        byte[] mask
+    ) {
+        int count = 0;
+
+        for (byte b : mask) {
+            if (
+                (b & 0xff) ==
+                0xff
+            ) {
+                count++;
+            }
+        }
+
+        return count;
+    }
+
+    // ================================================================
+    // JSON loading
+    // ================================================================
+
+    private List<JsonObject> loadJsonItems(
+        String requiredName,
+        String optionalName
+    ) throws Exception {
+
+        List<JsonObject> result =
+            new ArrayList<>();
+
+        File required =
+            new File(
+                dataDirectory,
+                requiredName
+            );
+
+        if (!required.isFile()) {
+            throw new IllegalStateException(
+                "Missing required file: " +
+                required.getAbsolutePath()
+            );
+        }
+
+        result.addAll(
+            readJsonArray(required)
+        );
+
+        File optional =
+            new File(
+                dataDirectory,
+                optionalName
+            );
+
+        if (optional.isFile()) {
+            result.addAll(
+                readJsonArray(optional)
+            );
+        }
+
+        return result;
+    }
+
+    private List<JsonObject> readJsonArray(
+        File file
+    ) throws Exception {
+
+        List<JsonObject> result =
+            new ArrayList<>();
+
+        try (
+            FileReader reader =
+                new FileReader(file)
+        ) {
+
+            JsonArray array =
+                gson.fromJson(
+                    reader,
+                    JsonArray.class
+                );
+
+            if (array == null) {
+                return result;
+            }
+
+            for (JsonElement element :
+                array) {
+
+                if (
+                    element != null &&
+                    element.isJsonObject()
+                ) {
+                    result.add(
+                        element.getAsJsonObject()
+                    );
+                }
+            }
+        }
+
+        return result;
+    }
+
+    private String getString(
+        JsonObject item,
+        String key,
+        String defaultValue
+    ) {
+        if (
+            item == null ||
+            !item.has(key) ||
+            item.get(key).isJsonNull()
+        ) {
+            return defaultValue;
+        }
+
+        return item
+            .get(key)
+            .getAsString();
+    }
+
+    private int getInt(
+        JsonObject item,
+        String key,
+        int defaultValue
+    ) {
+        if (
+            item == null ||
+            !item.has(key) ||
+            item.get(key).isJsonNull()
+        ) {
+            return defaultValue;
+        }
+
+        return item
+            .get(key)
+            .getAsInt();
+    }
+
+    // ================================================================
+    // Pattern scanner
+    // ================================================================
+
+    /*
+     * IDA-style:
+     *
+     * 48 8B 05 ?? ?? ?? ?? 48 85 C0
+     *
+     * Ghidra mask:
+     *
+     * exact byte -> FF
+     * wildcard   -> 00
+     */
+    private PatternBytes parsePattern(
+        String pattern
+    ) {
+        if (pattern == null) {
+            throw new IllegalArgumentException(
+                "Pattern is null"
+            );
+        }
+
+        String trimmed =
+            pattern.trim();
+
+        if (trimmed.isEmpty()) {
+            throw new IllegalArgumentException(
+                "Pattern is empty"
+            );
+        }
+
+        String[] tokens =
+            trimmed.split("\\s+");
+
+        byte[] bytes =
+            new byte[tokens.length];
+
+        byte[] mask =
+            new byte[tokens.length];
+
+        for (
+            int i = 0;
+            i < tokens.length;
+            i++
+        ) {
+
+            String token =
+                tokens[i].trim();
+
+            if (
+                token.equals("?") ||
+                token.equals("??")
+            ) {
+                bytes[i] = 0;
+                mask[i] = 0;
+                continue;
+            }
+
+            if (token.length() != 2) {
+                throw new IllegalArgumentException(
+                    "Unsupported pattern token '" +
+                    token +
+                    "' in: " +
+                    pattern
+                );
+            }
+
+            bytes[i] =
+                (byte)Integer.parseInt(
+                    token,
+                    16
+                );
+
+            mask[i] =
+                (byte)0xff;
+        }
+
+        return new PatternBytes(
+            bytes,
+            mask
+        );
+    }
+
+    private Address findPattern(
+        String pattern
+    ) throws Exception {
+
+        PatternBytes parsed =
+            parsePattern(pattern);
+
+        Memory memory =
+            currentProgram.getMemory();
+
+        for (MemoryBlock block :
+            memory.getBlocks()) {
+
+            if (monitor.isCancelled()) {
+                return null;
+            }
+
+            if (!block.isInitialized()) {
+                continue;
+            }
+
+            if (
+                block.getSize() <
+                parsed.bytes.length
+            ) {
+                continue;
+            }
+
+            Address result =
+                memory.findBytes(
+                    block.getStart(),
+                    block.getEnd(),
+                    parsed.bytes,
+                    parsed.mask,
+                    true,
+                    monitor
+                );
+
+            if (result != null) {
+                return result;
+            }
+        }
+
         return null;
     }
 
-    private boolean hasDataFiles(File dir) {
-        return dir != null &&
-            new File(dir, "data/functions.json").isFile() &&
-            new File(dir, "data/variables.json").isFile();
-    }
+    // ================================================================
+    // Signature target resolution
+    // ================================================================
 
-    private List<JsonObject> loadEntries(String publicName, String privateName) throws IOException {
-        ArrayList<JsonObject> out = new ArrayList<>();
-        readJsonArray(new File(d2rDir, "data/" + publicName), out);
-        File optional = new File(d2rDir, "data/" + privateName);
-        if (optional.isFile()) readJsonArray(optional, out);
-        out.sort(Comparator.comparing(o -> getString(o, "name", "")));
-        return out;
-    }
+    private Address resolveItemAddress(
+        JsonObject item
+    ) throws Exception {
 
-    private void readJsonArray(File file, List<JsonObject> out) throws IOException {
-        String text = Files.readString(file.toPath(), StandardCharsets.UTF_8);
-        JsonArray array = JsonParser.parseString(text).getAsJsonArray();
-        for (JsonElement e : array) out.add(e.getAsJsonObject());
-    }
+        String pattern =
+            getString(
+                item,
+                "pattern",
+                null
+            );
 
-    private void applyFunctionEntry(JsonObject item) {
-        String name = getString(item, "name", "unnamed");
-        Address resolved = resolveItem(item);
-        if (resolved == null) {
-            brokenCount++;
-            println(String.format("[BROKEN] %-60s pattern not found/resolved", name));
-            return;
+        String type =
+            getString(
+                item,
+                "type",
+                "absolute"
+            );
+
+        if (
+            pattern == null ||
+            pattern.trim().isEmpty()
+        ) {
+            return null;
         }
 
-        try {
-            Function f = getOrCreateFunction(resolved, name);
-            if (f == null) {
-                println("[WARN] Could not create function " + name + " at " + resolved);
-                return;
-            }
+        Address match =
+            findPattern(pattern);
 
-            f.setName(name, SourceType.USER_DEFINED);
-            functionCount++;
-
-            String summary = getString(item, "summary", null);
-            if (summary != null && !summary.isBlank()) {
-                f.setComment(summary);
-                setPlateComment(resolved, summary);
-            }
-
-            String ret = getString(item, "ret", null);
-            String args = getString(item, "args", null);
-            if (ret != null && args != null) {
-                applyFunctionSignature(f, ret, name, args);
-            }
-
-            println(String.format("[FUNC]   %-60s %s (+0x%X)", name, resolved, resolved.subtract(imageBase)));
-        }
-        catch (Exception e) {
-            println("[WARN] " + name + " at " + resolved + ": " + e.getMessage());
-        }
-    }
-
-    private void applyVariableEntry(JsonObject item) {
-        String name = getString(item, "name", "unnamed");
-        Address resolved = resolveItem(item);
-        if (resolved == null) {
-            brokenCount++;
-            println(String.format("[BROKEN] %-60s pattern not found/resolved", name));
-            return;
+        if (match == null) {
+            return null;
         }
 
-        try {
-            removeExistingUserSymbol(name, resolved);
-            createLabel(resolved, name, true, SourceType.USER_DEFINED);
-            variableCount++;
-
-            String summary = getString(item, "summary", null);
-            if (summary != null && !summary.isBlank()) setPlateComment(resolved, summary);
-
-            String ctype = getString(item, "ctype", null);
-            if (ctype != null && !ctype.equals("void")) {
-                applyVariableType(resolved, ctype);
-            }
-
-            println(String.format("[VAR]    %-60s %s (+0x%X)", name, resolved, resolved.subtract(imageBase)));
-        }
-        catch (Exception e) {
-            println("[WARN] " + name + " at " + resolved + ": " + e.getMessage());
-        }
-    }
-
-    private Address resolveItem(JsonObject item) {
-        String pattern = getString(item, "pattern", null);
-        if (pattern == null) return null;
-
-        Address match = findPattern(pattern);
-        if (match == null) return null;
-
-        String type = getString(item, "type", "absolute");
-        if (type.equals("absolute")) return match;
-
-        int operand = getInt(item, "operand", 0);
-        Instruction ins = listing.getInstructionAt(match);
-        if (ins == null) {
-            disassemble(match);
-            ins = listing.getInstructionAt(match);
-        }
-        if (ins == null || operand < 0 || operand >= ins.getNumOperands()) return null;
-
-        if (type.equals("operand")) {
-            Address target = resolveOperandReference(ins, operand);
-            if (target != null) return target;
-            return resolveOperandAddressObject(ins, operand);
+        if (
+            "absolute".equalsIgnoreCase(
+                type
+            )
+        ) {
+            return match;
         }
 
-        if (type.equals("other")) {
-            Long value = resolveOperandScalar(ins, operand);
-            if (value == null) {
-                Address a = resolveOperandAddressObject(ins, operand);
-                if (a != null) value = a.getOffset();
-            }
-            if (value == null) return null;
-            try {
-                return imageBase.add(value);
-            }
-            catch (AddressOutOfBoundsException e) {
-                return null;
-            }
+        int operandIndex =
+            getInt(
+                item,
+                "operand",
+                0
+            );
+
+        if (
+            "operand".equalsIgnoreCase(
+                type
+            )
+        ) {
+            return resolveOperandAddress(
+                match,
+                operandIndex,
+                false
+            );
         }
+
+        if (
+            "other".equalsIgnoreCase(
+                type
+            )
+        ) {
+            /*
+             * IDA version does:
+             *
+             * imageBase +
+             * get_operand_value(...)
+             */
+            return resolveOperandAddress(
+                match,
+                operandIndex,
+                true
+            );
+        }
+
+        println(
+            "Unknown signature type '" +
+            type +
+            "' for " +
+            getString(
+                item,
+                "name",
+                "<unnamed>"
+            )
+        );
 
         return match;
     }
 
-    private Address resolveOperandReference(Instruction ins, int operandIndex) {
-        Reference[] refs = ins.getOperandReferences(operandIndex);
-        for (Reference ref : refs) {
-            if (ref.isMemoryReference()) return ref.getToAddress();
-        }
-        return null;
-    }
+    private Address resolveOperandAddress(
+        Address instructionAddress,
+        int operandIndex,
+        boolean addImageBase
+    ) throws Exception {
 
-    private Address resolveOperandAddressObject(Instruction ins, int operandIndex) {
-        for (Object obj : ins.getOpObjects(operandIndex)) {
-            if (obj instanceof Address) return (Address)obj;
-        }
-        return null;
-    }
+        Instruction instruction =
+            currentProgram
+                .getListing()
+                .getInstructionAt(
+                    instructionAddress
+                );
 
-    private Long resolveOperandScalar(Instruction ins, int operandIndex) {
-        for (Object obj : ins.getOpObjects(operandIndex)) {
-            if (obj instanceof Scalar) return ((Scalar)obj).getUnsignedValue();
-        }
-        return null;
-    }
-
-    private Address findPattern(String text) {
-        PatternBytes p;
-        try {
-            p = parsePattern(text);
-        }
-        catch (IllegalArgumentException e) {
-            println("[WARN] Invalid pattern '" + text + "': " + e.getMessage());
+        if (instruction == null) {
             return null;
         }
 
-        for (MemoryBlock block : memory.getBlocks()) {
-            if (monitor.isCancelled()) return null;
-            if (!block.isInitialized()) continue;
-            Address found = memory.findBytes(block.getStart(), block.getEnd(), p.bytes, p.mask, true, monitor);
-            if (found != null) return found;
+        if (
+            operandIndex < 0 ||
+            operandIndex >=
+                instruction.getNumOperands()
+        ) {
+            return null;
         }
+
+        /*
+         * "other" signatures need the raw scalar displacement.
+         */
+        if (addImageBase) {
+            Scalar scalar =
+                getOperandScalar(
+                    instruction,
+                    operandIndex
+                );
+
+            if (scalar != null) {
+                try {
+                    return currentProgram
+                        .getImageBase()
+                        .add(
+                            scalar.getSignedValue()
+                        );
+                }
+                catch (Exception ignored) {
+                }
+            }
+        }
+
+        /*
+         * Ghidra normally creates references for:
+         * - CALL targets
+         * - JMP targets
+         * - RIP-relative variables
+         */
+        Reference[] refs =
+            instruction
+                .getOperandReferences(
+                    operandIndex
+                );
+
+        if (
+            refs != null &&
+            refs.length > 0
+        ) {
+
+            for (Reference ref : refs) {
+
+                Address to =
+                    ref.getToAddress();
+
+                if (
+                    to != null &&
+                    to.isMemoryAddress()
+                ) {
+                    return to;
+                }
+            }
+
+            if (
+                refs[0].getToAddress() != null
+            ) {
+                return refs[0]
+                    .getToAddress();
+            }
+        }
+
+        Scalar scalar =
+            getOperandScalar(
+                instruction,
+                operandIndex
+            );
+
+        if (scalar == null) {
+            return null;
+        }
+
+        /*
+         * Fallback for unresolved relative CALL/JMP.
+         */
+        String mnemonic =
+            instruction
+                .getMnemonicString()
+                .toUpperCase();
+
+        if (
+            mnemonic.startsWith("CALL") ||
+            mnemonic.startsWith("J")
+        ) {
+            try {
+                return instruction
+                    .getMaxAddress()
+                    .add(1)
+                    .add(
+                        scalar.getSignedValue()
+                    );
+            }
+            catch (Exception ignored) {
+            }
+        }
+
+        /*
+         * Last fallback: scalar interpreted as absolute address.
+         */
+        try {
+            AddressSpace space =
+                currentProgram
+                    .getAddressFactory()
+                    .getDefaultAddressSpace();
+
+            Address candidate =
+                space.getAddress(
+                    scalar.getUnsignedValue()
+                );
+
+            if (
+                currentProgram
+                    .getMemory()
+                    .contains(candidate)
+            ) {
+                return candidate;
+            }
+        }
+        catch (Exception ignored) {
+        }
+
         return null;
     }
 
-    private PatternBytes parsePattern(String text) {
-        String[] tokens = text.trim().split("\\s+");
-        byte[] bytes = new byte[tokens.length];
-        byte[] mask = new byte[tokens.length];
-        for (int i = 0; i < tokens.length; i++) {
-            String t = tokens[i].trim();
-            if (t.equals("?") || t.equals("??")) {
-                bytes[i] = 0;
-                mask[i] = 0;
-            }
-            else {
-                if (t.length() != 2) throw new IllegalArgumentException("bad byte token " + t);
-                bytes[i] = (byte)Integer.parseInt(t, 16);
-                mask[i] = (byte)0xff;
+    private Scalar getOperandScalar(
+        Instruction instruction,
+        int operandIndex
+    ) {
+        Object[] objects =
+            instruction.getOpObjects(
+                operandIndex
+            );
+
+        if (objects == null) {
+            return null;
+        }
+
+        for (Object object : objects) {
+            if (object instanceof Scalar) {
+                return (Scalar)object;
             }
         }
-        return new PatternBytes(bytes, mask);
+
+        return null;
     }
 
-    private Function getOrCreateFunction(Address address, String name) throws Exception {
-        Function f = functionManager.getFunctionAt(address);
-        if (f != null) return f;
+    // ================================================================
+    // Functions / variables
+    // ================================================================
 
-        disassemble(address);
-        f = createFunction(address, name);
-        if (f == null) f = functionManager.getFunctionAt(address);
-        return f;
-    }
+    private void processFunction(
+        JsonObject item
+    ) throws Exception {
 
-    private void removeExistingUserSymbol(String name, Address desiredAddress) {
-        SymbolIterator it = symbolTable.getSymbols(name);
-        while (it.hasNext()) {
-            Symbol s = it.next();
-            if (!s.getAddress().equals(desiredAddress) && s.getSource() == SourceType.USER_DEFINED) {
-                s.delete();
-            }
-        }
-    }
+        String name =
+            getString(
+                item,
+                "name",
+                "<unnamed>"
+            );
 
-    private void applyFunctionSignature(Function f, String ret, String name, String args) {
-        String cleanedRet = normalizeCType(ret);
-        String cleanedArgs = normalizeArgumentText(args);
-        String declaration = cleanedRet + " " + name + cleanedArgs;
+        Address address;
 
         try {
-            FunctionSignatureParser parser = new FunctionSignatureParser(dataTypeManager, dtmService);
-            FunctionSignature signature = parser.parse(null, declaration);
-            ApplyFunctionSignatureCmd cmd = new ApplyFunctionSignatureCmd(
-                f.getEntryPoint(), signature, SourceType.USER_DEFINED);
-            if (!cmd.applyTo(currentProgram, monitor)) {
-                typeFailureCount++;
-                appendRepeatableComment(f, "d2.re signature: " + declaration);
-            }
+            address =
+                resolveItemAddress(item);
         }
         catch (Exception e) {
-            typeFailureCount++;
-            appendRepeatableComment(f, "d2.re signature: " + declaration);
+            brokenSignatures++;
+
+            println(
+                "[ERROR] " +
+                name +
+                " - scanner error: " +
+                e.getMessage()
+            );
+
+            return;
+        }
+
+        if (address == null) {
+            brokenSignatures++;
+
+            println(
+                "[BROKEN] " +
+                name +
+                " - signature not found/resolved"
+            );
+
+            return;
+        }
+
+        Function function =
+            ensureFunction(
+                address,
+                name
+            );
+
+        if (function == null) {
+            resolutionFailures++;
+
+            println(
+                "[RESOLVE FAILED] " +
+                name +
+                " @ " +
+                address
+            );
+
+            return;
+        }
+
+        try {
+            function.setName(
+                name,
+                SourceType.USER_DEFINED
+            );
+        }
+        catch (Exception e) {
+            println(
+                "[NAME FAILED] " +
+                name +
+                " @ " +
+                address +
+                ": " +
+                e.getMessage()
+            );
+
+            return;
+        }
+
+        String summary =
+            getString(
+                item,
+                "summary",
+                null
+            );
+
+        applySummary(
+            address,
+            function,
+            summary
+        );
+
+        renamedFunctions++;
+
+        println(
+            "[FUNC] " +
+            name +
+            " @ " +
+            address
+        );
+    }
+
+    private void processVariable(
+        JsonObject item
+    ) throws Exception {
+
+        String name =
+            getString(
+                item,
+                "name",
+                "<unnamed>"
+            );
+
+        Address address;
+
+        try {
+            address =
+                resolveItemAddress(item);
+        }
+        catch (Exception e) {
+            brokenSignatures++;
+
+            println(
+                "[ERROR] " +
+                name +
+                " - scanner error: " +
+                e.getMessage()
+            );
+
+            return;
+        }
+
+        if (address == null) {
+            brokenSignatures++;
+
+            println(
+                "[BROKEN] " +
+                name +
+                " - signature not found/resolved"
+            );
+
+            return;
+        }
+
+        try {
+            createOrRenameGlobalLabel(
+                address,
+                name
+            );
+        }
+        catch (Exception e) {
+            resolutionFailures++;
+
+            println(
+                "[NAME FAILED] " +
+                name +
+                " @ " +
+                address +
+                ": " +
+                e.getMessage()
+            );
+
+            return;
+        }
+
+        String summary =
+            getString(
+                item,
+                "summary",
+                null
+            );
+
+        applySummary(
+            address,
+            null,
+            summary
+        );
+
+        renamedVariables++;
+
+        println(
+            "[VAR ] " +
+            name +
+            " @ " +
+            address
+        );
+    }
+
+    private Function ensureFunction(
+        Address address,
+        String name
+    ) {
+
+        Function function =
+            currentProgram
+                .getFunctionManager()
+                .getFunctionAt(address);
+
+        if (function != null) {
+            return function;
+        }
+
+        try {
+            function =
+                createFunction(
+                    address,
+                    name
+                );
+        }
+        catch (Exception ignored) {
+            function = null;
+        }
+
+        if (function == null) {
+            return currentProgram
+                .getFunctionManager()
+                .getFunctionAt(address);
+        }
+
+        return function;
+    }
+
+    private void createOrRenameGlobalLabel(
+        Address address,
+        String name
+    ) throws Exception {
+
+        Symbol primary =
+            currentProgram
+                .getSymbolTable()
+                .getPrimarySymbol(address);
+
+        if (
+            primary != null &&
+            primary.getSource() ==
+                SourceType.DEFAULT
+        ) {
+            primary.setName(
+                name,
+                SourceType.USER_DEFINED
+            );
+
+            return;
+        }
+
+        List<Symbol> existing =
+            currentProgram
+                .getSymbolTable()
+                .getGlobalSymbols(name);
+
+        if (existing != null) {
+            for (Symbol symbol :
+                existing) {
+
+                if (
+                    address.equals(
+                        symbol.getAddress()
+                    )
+                ) {
+                    if (!symbol.isPrimary()) {
+                        symbol.setPrimary();
+                    }
+
+                    return;
+                }
+            }
+        }
+
+        Symbol created =
+            currentProgram
+                .getSymbolTable()
+                .createLabel(
+                    address,
+                    name,
+                    SourceType.USER_DEFINED
+                );
+
+        if (
+            created != null &&
+            !created.isPrimary()
+        ) {
+            created.setPrimary();
         }
     }
 
-    private String normalizeCType(String s) {
-        if (s == null) return "void";
-        return s
-            .replace("unsigned __int64", "uint64_t")
-            .replace("unsigned __int32", "uint32_t")
-            .replace("unsigned __int16", "uint16_t")
-            .replace("unsigned __int8", "uint8_t")
-            .replace("__int64", "int64_t")
-            .replace("__int32", "int32_t")
-            .replace("__int16", "int16_t")
-            .replace("__int8", "int8_t")
-            .replace("__fastcall", "")
-            .replace("__stdcall", "")
-            .replace("__cdecl", "")
-            .replaceAll("\\s+", " ")
-            .trim();
-    }
+    private void applySummary(
+        Address address,
+        Function function,
+        String summary
+    ) {
 
-    private String normalizeArgumentText(String args) {
-        String s = normalizeCType(args);
-        if (s.equals("()")) return "(void)";
-        return s;
-    }
+        if (
+            summary == null ||
+            summary.trim().isEmpty()
+        ) {
+            return;
+        }
 
-    private void appendRepeatableComment(Function f, String text) {
-        String old = f.getRepeatableComment();
-        if (old == null || old.isBlank()) f.setRepeatableComment(text);
-        else if (!old.contains(text)) f.setRepeatableComment(old + "\n" + text);
-    }
-
-    private void applyVariableType(Address address, String ctype) {
         try {
-            String normalized = normalizeCType(ctype);
-            DataTypeParser parser = new DataTypeParser(
-                dataTypeManager, dataTypeManager, null, AllowedDataTypes.ALL);
-            DataType dt = parser.parse(normalized);
-            if (dt == null || dt.getLength() <= 0) {
-                typeFailureCount++;
+            currentProgram
+                .getListing()
+                .setComment(
+                    address,
+                    CodeUnit.PLATE_COMMENT,
+                    summary
+                );
+        }
+        catch (Exception ignored) {
+        }
+
+        if (function != null) {
+            try {
+                function.setComment(
+                    summary
+                );
+            }
+            catch (Exception ignored) {
+            }
+        }
+    }
+
+    // ================================================================
+    // Known D2R function tables
+    // ================================================================
+
+    private void expandKnownFunctionTables()
+        throws Exception {
+
+        expandD2GSS2C();
+
+        expandSimplePointerTable(
+            "g_D2GS_C2S_FunctionTable",
+            0x64,
+            0x8,
+            "D2GS_C2S_0x%02X_PacketHandler"
+        );
+
+        expandSimplePointerTable(
+            "g_SkillsSrvStFunc",
+            0x42,
+            0x8,
+            "SKILLS_SrvStFunc_%03d"
+        );
+
+        expandSimplePointerTable(
+            "g_SkillsSrvDoFunc",
+            0x98,
+            0x8,
+            "SKILLS_SrvDoFunc_%03d"
+        );
+
+        expandSimplePointerTable(
+            "g_SkillsCltStFunc",
+            0x35,
+            0x8,
+            "SKILLS_CltStFunc_%03d"
+        );
+
+        expandSimplePointerTable(
+            "g_SkillsCltDoFunc",
+            0x60,
+            0x8,
+            "SKILLS_CltDoFunc_%03d"
+        );
+
+        expandSimplePointerTable(
+            "g_AssignProperty",
+            0x20,
+            0x8,
+            "ITEMMODS_PropertyFunc_%02d"
+        );
+    }
+
+    private void expandD2GSS2C()
+        throws Exception {
+
+        Address table =
+            getGlobalAddress(
+                "g_D2GS_S2C_FunctionTable"
+            );
+
+        if (table == null) {
+            println(
+                "Skipping g_D2GS_S2C_FunctionTable " +
+                "expansion (table not resolved)"
+            );
+            return;
+        }
+
+        println(
+            "Expanding g_D2GS_S2C_FunctionTable @ " +
+            table
+        );
+
+        for (
+            int i = 0;
+            i < 0xAE;
+            i++
+        ) {
+
+            if (monitor.isCancelled()) {
                 return;
             }
 
-            Data existing = listing.getDataAt(address);
-            if (existing != null && existing.isDefined() && existing.getDataType().isEquivalent(dt)) return;
+            Address entry =
+                table.add(
+                    (long)i * 0x18L
+                );
 
-            Address end = address.add(Math.max(0, dt.getLength() - 1));
-            listing.clearCodeUnits(address, end, false);
-            listing.createData(address, dt);
-        }
-        catch (Exception e) {
-            typeFailureCount++;
-            setPlateComment(address, mergeComment(getPlateComment(address), "d2.re type: " + ctype));
-        }
-    }
+            Address handler =
+                readPointer(entry);
 
-    private String mergeComment(String old, String extra) {
-        if (old == null || old.isBlank()) return extra;
-        if (old.contains(extra)) return old;
-        return old + "\n" + extra;
-    }
-
-    private void renameKnownTables(List<JsonObject> variables) {
-        renameTable(variables, "g_D2GS_S2C_FunctionTable", 0xAE, 0x18, true, 0x10, "D2GS_S2C_0x%02X_PacketHandler", "D2GS_S2C_0x%02X_PacketHandlerEx");
-        renameSimpleFunctionTable(variables, "g_D2GS_C2S_FunctionTable", 0x64, "D2GS_C2S_0x%02X_PacketHandler");
-        renameSimpleFunctionTable(variables, "g_SkillsSrvStFunc", 0x42, "SKILLS_SrvStFunc_%03d");
-        renameSimpleFunctionTable(variables, "g_SkillsSrvDoFunc", 0x98, "SKILLS_SrvDoFunc_%03d");
-        renameSimpleFunctionTable(variables, "g_SkillsCltStFunc", 0x35, "SKILLS_CltStFunc_%03d");
-        renameSimpleFunctionTable(variables, "g_SkillsCltDoFunc", 0x60, "SKILLS_CltDoFunc_%03d");
-        renameSimpleFunctionTable(variables, "g_AssignProperty", 0x20, "ITEMMODS_PropertyFunc_%02d");
-    }
-
-    private JsonObject findByName(List<JsonObject> entries, String name) {
-        for (JsonObject e : entries) if (name.equals(getString(e, "name", ""))) return e;
-        return null;
-    }
-
-    private void renameSimpleFunctionTable(List<JsonObject> variables, String variableName, int count, String format) {
-        JsonObject item = findByName(variables, variableName);
-        if (item == null) return;
-        Address table = resolveItem(item);
-        if (table == null) return;
-
-        println("Expanding table " + variableName + " at " + table);
-        for (int i = 0; i < count; i++) {
-            if (monitor.isCancelled()) return;
-            Address slot = table.add((long)i * 8L);
-            Address target = readPointer(slot);
-            if (target == null || target.getOffset() == 0) continue;
-            String name = String.format(format, i);
-            renameTableFunction(target, name);
-        }
-    }
-
-    private void renameTable(List<JsonObject> variables, String variableName, int count, int stride,
-                             boolean namePacketSize, int secondPointerOffset,
-                             String firstFormat, String secondFormat) {
-        JsonObject item = findByName(variables, variableName);
-        if (item == null) return;
-        Address table = resolveItem(item);
-        if (table == null) return;
-
-        println("Expanding table " + variableName + " at " + table);
-        for (int i = 0; i < count; i++) {
-            if (monitor.isCancelled()) return;
-            Address row = table.add((long)i * stride);
-            Address first = readPointer(row);
-            if (first != null && first.getOffset() != 0) renameTableFunction(first, String.format(firstFormat, i));
-
-            if (namePacketSize) {
-                try {
-                    createLabel(row.add(8), String.format("D2GS_S2C_0x%02X_PacketSize", i), true, SourceType.USER_DEFINED);
-                }
-                catch (Exception ignored) { }
+            if (handler != null) {
+                renameTableFunction(
+                    handler,
+                    String.format(
+                        "D2GS_S2C_0x%02X_PacketHandler",
+                        i
+                    )
+                );
             }
 
-            Address second = readPointer(row.add(secondPointerOffset));
-            if (second != null && second.getOffset() != 0) renameTableFunction(second, String.format(secondFormat, i));
-        }
-    }
+            Address sizeAddress =
+                entry.add(0x8);
 
-    private void renameTableFunction(Address target, String name) {
-        try {
-            Function f = getOrCreateFunction(target, name);
-            if (f != null) {
-                f.setName(name, SourceType.USER_DEFINED);
-                functionCount++;
+            try {
+                createOrRenameGlobalLabel(
+                    sizeAddress,
+                    String.format(
+                        "D2GS_S2C_0x%02X_PacketSize",
+                        i
+                    )
+                );
+            }
+            catch (Exception ignored) {
+            }
+
+            Address handlerEx =
+                readPointer(
+                    entry.add(0x10)
+                );
+
+            if (handlerEx != null) {
+                renameTableFunction(
+                    handlerEx,
+                    String.format(
+                        "D2GS_S2C_0x%02X_PacketHandlerEx",
+                        i
+                    )
+                );
             }
         }
-        catch (Exception e) {
-            println("[WARN] Could not rename table function " + name + " at " + target);
+    }
+
+    private void expandSimplePointerTable(
+        String tableName,
+        int count,
+        int stride,
+        String format
+    ) throws Exception {
+
+        Address table =
+            getGlobalAddress(
+                tableName
+            );
+
+        if (table == null) {
+            println(
+                "Skipping " +
+                tableName +
+                " expansion " +
+                "(table not resolved)"
+            );
+
+            return;
+        }
+
+        println(
+            "Expanding " +
+            tableName +
+            " @ " +
+            table
+        );
+
+        for (
+            int i = 0;
+            i < count;
+            i++
+        ) {
+
+            if (monitor.isCancelled()) {
+                return;
+            }
+
+            Address pointerAddress =
+                table.add(
+                    (long)i *
+                    (long)stride
+                );
+
+            Address functionAddress =
+                readPointer(
+                    pointerAddress
+                );
+
+            if (functionAddress == null) {
+                continue;
+            }
+
+            String functionName =
+                String.format(
+                    format,
+                    i
+                );
+
+            renameTableFunction(
+                functionAddress,
+                functionName
+            );
         }
     }
 
-    private Address readPointer(Address address) {
+    private void renameTableFunction(
+        Address address,
+        String name
+    ) {
+
+        if (
+            address == null ||
+            !currentProgram
+                .getMemory()
+                .contains(address)
+        ) {
+            return;
+        }
+
+        Function function =
+            ensureFunction(
+                address,
+                name
+            );
+
+        if (function == null) {
+            return;
+        }
+
         try {
-            long value = memory.getLong(address);
-            if (value == 0) return null;
-            return address.getAddressSpace().getAddress(value);
+            function.setName(
+                name,
+                SourceType.USER_DEFINED
+            );
+
+            renamedFunctions++;
+        }
+        catch (Exception ignored) {
+        }
+    }
+
+    private Address getGlobalAddress(
+        String name
+    ) {
+
+        List<Symbol> symbols =
+            currentProgram
+                .getSymbolTable()
+                .getGlobalSymbols(name);
+
+        if (
+            symbols == null ||
+            symbols.isEmpty()
+        ) {
+            return null;
+        }
+
+        return symbols
+            .get(0)
+            .getAddress();
+    }
+
+    private Address readPointer(
+        Address pointerAddress
+    ) {
+
+        try {
+            long raw =
+                currentProgram
+                    .getMemory()
+                    .getLong(
+                        pointerAddress
+                    );
+
+            if (raw == 0) {
+                return null;
+            }
+
+            AddressSpace space =
+                currentProgram
+                    .getAddressFactory()
+                    .getDefaultAddressSpace();
+
+            Address target =
+                space.getAddress(raw);
+
+            if (
+                !currentProgram
+                    .getMemory()
+                    .contains(target)
+            ) {
+                return null;
+            }
+
+            return target;
         }
         catch (Exception e) {
             return null;
         }
-    }
-
-    private String getString(JsonObject o, String key, String defaultValue) {
-        JsonElement e = o.get(key);
-        if (e == null || e.isJsonNull()) return defaultValue;
-        return e.getAsString();
-    }
-
-    private int getInt(JsonObject o, String key, int defaultValue) {
-        JsonElement e = o.get(key);
-        if (e == null || e.isJsonNull()) return defaultValue;
-        try { return e.getAsInt(); }
-        catch (Exception ex) { return defaultValue; }
     }
 }
