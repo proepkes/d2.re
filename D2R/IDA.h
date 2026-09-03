@@ -146,6 +146,23 @@ struct D2RoomCoordListStrc;
 typedef int32_t(__fastcall *UNITFINDTEST)(D2UnitStrc *pUnit, D2UnitFindArgStrc *pUnitFindArg);
 #pragma pack(push, 1)
 
+struct D2DrlgCoordStrc
+{
+    int32_t nPosX;	//0x00
+    int32_t nPosY;	//0x04
+    int32_t nWidth;	//0x08
+    int32_t nHeight;	//0x0C
+};
+
+struct D2DrlgGridStrc
+{
+    int32_t* pCellsFlags;	//0x00
+    int32_t* pCellsRowOffsets;	//0x04
+    int32_t nWidth;	//0x08
+    int32_t nHeight;	//0x0C
+    int32_t unk0x10;	//0x10 Maybe indicates if uninitialized? No memset when set to 1
+};
+
 struct D2LevelDefBin
 {
 	uint32_t dwQuestFlag;				//0x00
@@ -2975,15 +2992,6 @@ struct D2DrlgFileStrc
     D2DrlgFileStrc* pNext;	//0x58
 };
 
-struct D2DrlgGridStrc
-{
-    int32_t* pCellsFlags;	//0x00
-    int32_t* pCellsRowOffsets;	//0x04
-    int32_t nWidth;	//0x08
-    int32_t nHeight;	//0x0C
-    int32_t unk0x10;	//0x10 Maybe indicates if uninitialized? No memset when set to 1
-};
-
 struct D2DrlgRoomTilesStrc
 {
     D2DrlgTileDataStrc* pWallTiles;	//0x00
@@ -3018,14 +3026,6 @@ struct D2DrlgAnimTileGridStrc
     int32_t nCurrentFrame;	//0x08
     int32_t nAnimationSpeed;	//0x0C
     D2DrlgAnimTileGridStrc* pNext;	//0x10
-};
-
-struct D2DrlgCoordStrc
-{
-    int32_t nPosX;	//0x00
-    int32_t nPosY;	//0x04
-    int32_t nWidth;	//0x08
-    int32_t nHeight;	//0x0C
 };
 
 struct D2DrlgMapStrc
